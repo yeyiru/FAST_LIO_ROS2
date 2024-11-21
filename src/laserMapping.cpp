@@ -44,6 +44,7 @@
 #include <so3_math.h>
 #include <rclcpp/rclcpp.hpp>
 #include <Eigen/Core>
+#include <Eigen/Dense>
 #include "IMU_Processing.hpp"
 #include <nav_msgs/msg/odometry.hpp>
 #include <nav_msgs/msg/path.hpp>
@@ -98,7 +99,6 @@ bool   point_selected_surf[100000] = {0};
 bool   lidar_pushed, flg_first_scan = true, flg_exit = false, flg_EKF_inited;
 bool   scan_pub_en = false, dense_pub_en = false, scan_body_pub_en = false;
 bool    is_first_lidar = true;
-
 vector<vector<int>>  pointSearchInd_surf; 
 vector<BoxPointType> cub_needrm;
 vector<PointVector>  Nearest_Points; 
@@ -625,7 +625,10 @@ void set_posestamp(T & out)
     
 }
 
-void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped, std::unique_ptr<tf2_ros::TransformBroadcaster> & tf_br)
+void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped,
+                      const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomCamAftMapped,
+                      std::unique_ptr<tf2_ros::TransformBroadcaster> & tf_br,
+                      const Eigen::Matrix4d & lidar_to_camera)
 {
     odomAftMapped.header.frame_id = "camera_init";
     odomAftMapped.child_frame_id = "body";
@@ -656,6 +659,59 @@ void publish_odometry(const rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPt
     trans.transform.rotation.y = odomAftMapped.pose.pose.orientation.y;
     trans.transform.rotation.z = odomAftMapped.pose.pose.orientation.z;
     tf_br->sendTransform(trans);
+        
+    // 从LiDAR的里程计计算Camera的里程计
+    Eigen::Matrix3d R_W_L; // R_raw
+    Eigen::Vector3d t_W_L; // t_raw
+    {
+        const auto& pose = odomAftMapped.pose.pose;
+        Eigen::Quaterniond q(pose.orientation.w, pose.orientation.x, pose.orientation.y, pose.orientation.z);
+        t_W_L = Eigen::Vector3d(pose.position.x, pose.position.y, pose.position.z);
+        R_W_L = q.toRotationMatrix();
+    }
+
+    // 提取LiDAR到Camera的旋转和平移
+    Eigen::Matrix3d R_L_C = lidar_to_camera.block<3,3>(0,0); //R_Lidar
+    Eigen::Vector3d t_L_C = lidar_to_camera.block<3,1>(0,3); //t_Lidar
+
+    // 计算Camera在世界坐标系下的姿态
+    Eigen::Matrix3d R_W_C = R_W_L * R_L_C.inverse();
+    Eigen::Vector3d t_W_C = -R_W_L * R_L_C.inverse() * t_L_C + t_W_L;
+
+    // 将旋转矩阵转换为四元数
+    Eigen::Quaterniond q_W_C(R_W_C);
+
+    nav_msgs::msg::Odometry odomCamera;
+    odomCamera.header.frame_id = "camera_init";
+    odomCamera.child_frame_id = "camera_body";
+    odomCamera.header.stamp = odomAftMapped.header.stamp;
+    odomCamera.pose.pose.position.x = t_W_C.x();
+    odomCamera.pose.pose.position.y = t_W_C.y();
+    odomCamera.pose.pose.position.z = t_W_C.z();
+    odomCamera.pose.pose.orientation.w = q_W_C.w();
+    odomCamera.pose.pose.orientation.x = q_W_C.x();
+    odomCamera.pose.pose.orientation.y = q_W_C.y();
+    odomCamera.pose.pose.orientation.z = q_W_C.z();
+
+    // 假设协方差与LiDAR一致，直接拷贝
+    odomCamera.pose.covariance = odomAftMapped.pose.covariance;
+
+    // 发布Camera的里程计
+    pubOdomCamAftMapped->publish(odomCamera);
+
+    // 构建TF广播的Camera信息
+    geometry_msgs::msg::TransformStamped trans_camera;
+    trans_camera.header.frame_id = "camera_init";
+    trans_camera.header.stamp = odomCamera.header.stamp;
+    trans_camera.child_frame_id = "camera_body";
+    trans_camera.transform.translation.x = t_W_C.x();
+    trans_camera.transform.translation.y = t_W_C.y();
+    trans_camera.transform.translation.z = t_W_C.z();
+    trans_camera.transform.rotation.w = q_W_C.w();
+    trans_camera.transform.rotation.x = q_W_C.x();
+    trans_camera.transform.rotation.y = q_W_C.y();
+    trans_camera.transform.rotation.z = q_W_C.z();
+    tf_br->sendTransform(trans_camera);
 }
 
 void publish_path(rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath)
@@ -879,9 +935,14 @@ public:
         // int effect_feat_num = 0, frame_num = 0;
         // double deltaT, deltaR, aver_time_consu = 0, aver_time_icp = 0, aver_time_match = 0, aver_time_incre = 0, aver_time_solve = 0, aver_time_const_H_time = 0;
         // bool flg_EKF_converged, EKF_stop_flg = 0;
-
+        
         FOV_DEG = (fov_deg + 10.0) > 179.9 ? 179.9 : (fov_deg + 10.0);
         HALF_FOV_COS = cos((FOV_DEG) * 0.5 * PI_M / 180.0);
+
+        lidar_to_camera << 0.0105077,-0.999929,0.00554737,0.0136298,
+                           -0.00872274,-0.00563912,-0.999946,-0.169386,
+                           0.999907,0.0104588,-0.00878138,-0.0632702,
+                           0,0,0,1;
 
         _featsArray.reset(new PointCloudXYZI());
 
@@ -932,6 +993,7 @@ public:
         pubLaserCloudEffect_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_effected", 20);
         pubLaserCloudMap_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/Laser_map", 20);
         pubOdomAftMapped_ = this->create_publisher<nav_msgs::msg::Odometry>("/Odometry", 20);
+        pubOdomCamAftMapped_ = this->create_publisher<nav_msgs::msg::Odometry>("/Odometry/Camera", 20);
         pubPath_ = this->create_publisher<nav_msgs::msg::Path>("/path", 20);
         tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
 
@@ -1061,7 +1123,7 @@ private:
             double t_update_end = omp_get_wtime();
 
             /******* Publish odometry *******/
-            publish_odometry(pubOdomAftMapped_, tf_broadcaster_);
+            publish_odometry(pubOdomAftMapped_, pubOdomCamAftMapped_, tf_broadcaster_, lidar_to_camera);
 
             /*** add the feature points to map kdtree ***/
             t3 = omp_get_wtime();
@@ -1134,6 +1196,7 @@ private:
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudEffect_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudMap_;
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomAftMapped_;
+    rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr pubOdomCamAftMapped_;
     rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr pubPath_;
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr sub_imu_;
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_pcl_pc_;
@@ -1149,6 +1212,8 @@ private:
     double deltaT, deltaR, aver_time_consu = 0, aver_time_icp = 0, aver_time_match = 0, aver_time_incre = 0, aver_time_solve = 0, aver_time_const_H_time = 0;
     bool flg_EKF_converged, EKF_stop_flg = 0;
     double epsi[23] = {0.001};
+
+    Eigen::Matrix4d lidar_to_camera;
 
     FILE *fp;
     ofstream fout_pre, fout_out, fout_dbg;
